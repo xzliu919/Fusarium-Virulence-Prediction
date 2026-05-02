@@ -1,1 +1,7 @@
+Species	 Phenotype_WheatHead	 Phenotype_WheatStem	Phenotype_MaizeStem	Phenotype_SoybeanStem	Species_Complex
+Fusarium_aberrans__CBS_119866	0	0	0	0	FIESC
+Fusarium_californicum__CBS_145796	0.92222	2.171428571	0	0	FTSC
+Fusarium_languescens__CBS_645.78	0	1.8	0.7125	0.575
+Fusarium_pseudograminearum__CS3096	2.30555	2.54	0.733333333	2.7	FSAMSC
+Fusarium_flocciferum__CBS_821.68	0	0	0.6175	0	FTSC
 
