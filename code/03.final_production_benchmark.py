@@ -98,6 +98,32 @@ def train_dl_model(X_train, y_train, X_test, epochs, batch_size, arch_name):
     with torch.no_grad(): preds = model(torch.tensor(X_test, dtype=torch.float32).unsqueeze(1).to(device)).cpu().numpy().squeeze()
     return np.expand_dims(preds, 0) if preds.ndim == 0 else preds
 
+# --- 新增：用于在全量数据上训练冠军模型并返回模型实例 ---
+def train_final_dl_model(X_train, y_train, epochs, batch_size, arch_name):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    in_features = X_train.shape[1]
+    if arch_name == 'MLP': model = Net_MLP(in_features)
+    elif arch_name == 'PNNGS': model = Net_PNNGS(in_features)
+    elif arch_name == 'ResGS': model = Net_ResGS(in_features)
+    elif arch_name == 'TabAttention': model = Net_TabAttention(in_features)
+    
+    if torch.cuda.device_count() > 1: model = nn.DataParallel(model)
+    model = model.to(device)
+
+    dataset = torch.utils.data.TensorDataset(torch.tensor(X_train, dtype=torch.float32).unsqueeze(1), torch.tensor(y_train, dtype=torch.float32).unsqueeze(1))
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    optimizer, criterion = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4), nn.MSELoss()
+    
+    model.train()
+    for _ in range(epochs):
+        for bx, by in loader:
+            optimizer.zero_grad()
+            loss = criterion(model(bx.to(device)), by.to(device))
+            loss.backward()
+            optimizer.step()
+            
+    return model
+
 # ==========================================
 # 2. 核心工具函数与主流程
 # ==========================================
@@ -229,7 +255,6 @@ def main():
             phy_pred_te = Ridge(alpha=10.0).fit(phylo_tr, y_tr).predict(phylo_te) if phylo_tr is not None else np.zeros_like(y_te)
             Xf_tr_s, Xf_te_s = StandardScaler().fit_transform(X_fused_tr), StandardScaler().fit(X_fused_tr).transform(X_fused_te)
             
-            # --- 修复了这里的变量名错误，将 res_tr_final 改为 res_tr_fin ---
             if model_name in base_ml_dict: res_pred_te = clone(base_ml_dict[model_name]).fit(Xf_tr_s, res_tr_fin).predict(Xf_te_s)
             else: res_pred_te = train_dl_model(Xf_tr_s, res_tr_fin, Xf_te_s, args.epochs, args.batch_size, model_name)
             
@@ -241,19 +266,38 @@ def main():
             if ho_mets['Pearson_r'] > best_overall_r:
                 best_overall_r, best_overall_model, best_overall_k = ho_mets['Pearson_r'], model_name, best_k
 
+        # ==========================================================
+        # 冠军模型全量数据训练与保存 (包含深度学习权重)
+        # ==========================================================
         print(f"\n[🏆] {pheno} 冠军模型: {best_overall_model} (K={best_overall_k})")
         top_ogs = [og_names[i] for i in sorted_ogs[:best_overall_k]]
         X_all_fused = extract_fused_features(top_ogs, pav_df.iloc[valid_idx], cnv_df.iloc[valid_idx], curr_species, args.h5_in, og_map_dict, args.pca_dim)
         
         phylo_all_model = Ridge(alpha=10.0).fit(phylo_emb_df.iloc[valid_idx].values, y) if phylo_emb_df is not None else None
+        y_res_all = y - phylo_all_model.predict(phylo_emb_df.iloc[valid_idx].values) if phylo_all_model else y
+        
         final_scaler = StandardScaler()
         X_all_fused_s = final_scaler.fit_transform(X_all_fused)
         
-        saved_fn = "DL_Architecture" if best_overall_model not in base_ml_dict else clone(base_ml_dict[best_overall_model]).fit(X_all_fused_s, y - phylo_all_model.predict(phylo_emb_df.iloc[valid_idx].values) if phylo_all_model else y)
+        dl_weight_path = None
+        if best_overall_model not in base_ml_dict:
+            print(f"  [+] 正在全量数据上重新训练深度学习冠军模型: {best_overall_model} ...")
+            final_dl_model = train_final_dl_model(X_all_fused_s, y_res_all, args.epochs, args.batch_size, best_overall_model)
+            saved_fn = "DeepLearning_PyTorch_Model"
+            dl_weight_path = os.path.join(args.outdir, "saved_models", f"{pheno}_{best_overall_model}_weights.pt")
+            
+            # 如果是多卡训练，保存前解包 (去掉 module. 前缀)，方便后续 CPU 推理
+            model_to_save = final_dl_model.module if isinstance(final_dl_model, nn.DataParallel) else final_dl_model
+            torch.save(model_to_save.state_dict(), dl_weight_path)
+            print(f"  [✔] 深度学习权重已独立保存至: {dl_weight_path}")
+        else:
+            saved_fn = clone(base_ml_dict[best_overall_model]).fit(X_all_fused_s, y_res_all)
         
         joblib.dump({
             'phenotype': pheno, 'top_ogs': top_ogs, 'phylo_baseline_model': phylo_all_model,
-            'scaler': final_scaler, 'functional_model_name': best_overall_model, 'functional_model': saved_fn
+            'scaler': final_scaler, 'functional_model_name': best_overall_model, 
+            'functional_model': saved_fn,
+            'dl_weight_file': dl_weight_path # 记录深度学习权重路径
         }, os.path.join(args.outdir, "saved_models", f"{pheno}_Production_Pipeline.pkl"))
 
     pd.DataFrame(all_cv_records).to_csv(os.path.join(args.outdir, "cv_fold_metrics.csv"), index=False)
